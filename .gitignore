@@ -17,3 +17,8 @@
 
 # Dependency directories
 .depend
+
+# Corpus grande e modelos treinados
+corpus_pt_BR.txt
+pipeline/model.bin
+__pycache__/
