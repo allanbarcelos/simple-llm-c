@@ -1,0 +1,19 @@
+# Compiled object files
+*.o
+
+# Executables
+*.exe
+*.out
+
+# Compiled dynamic libraries
+*.dll
+*.so
+*.dylib
+
+# Temporary files
+*.swp
+*~
+\#*\#
+
+# Dependency directories
+.depend
