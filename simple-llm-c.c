@@ -65,9 +65,7 @@ void generatePhrase(int numWords) {
     printf("\n");
 }
 
-int main() {
-    srand(time(0));
-
+void training() {
     char input[MAX_LEN];
     char dataset[MAX_WORDS][MAX_LEN];
     int numWords = 0;
@@ -77,7 +75,7 @@ int main() {
     while (1) {
         printf("> ");
         fgets(input, sizeof(input), stdin);
-        input[strlen(input) - 1] = '\0';  // remove new line chracter
+        input[strlen(input) - 1] = '\0';  // remove new line character
 
         if (strcmp(input, "exit") == 0) {
             break;
@@ -113,11 +111,42 @@ int main() {
         }
     }
 
-    printf("\nEnter the number of words to generate a phrase: ");
-    scanf("%d", &numWords);
+    printf("Training completed successfully.\n");
+}
 
-    generatePhrase(numWords);
+int main() {
+    srand(time(0));
+
+    int choice;
+    do {
+        printf("Menu:\n");
+        printf("1. Training\n");
+        printf("2. Generate Phrase\n");
+        printf("3. Exit\n");
+        printf("Enter your choice: ");
+        scanf("%d", &choice);
+
+        switch (choice) {
+            case 1:
+                training();
+                break;
+            case 2: {
+                int numWords;
+                printf("\nEnter the number of words to generate a phrase: ");
+                scanf("%d", &numWords);
+                generatePhrase(numWords);
+                break;
+            }
+            case 3:
+                printf("Exiting program.\n");
+                break;
+            default:
+                printf("Invalid choice. Please try again.\n");
+                break;
+        }
+
+        printf("\n");
+    } while (choice != 3);
 
     return 0;
 }
-
