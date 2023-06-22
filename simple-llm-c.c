@@ -17,55 +17,90 @@ typedef struct Node {
     struct Node* next;
 } Node;
 
-Node* start;
+typedef struct MarkovChain {
+    int count;
+    struct Node* nextWords;
+} MarkovChain;
+
+MarkovChain* markovChain;
 
 void insertWord(char* word) {
     Node* newNode = (Node*)malloc(sizeof(Node));
     strcpy(newNode->word, word);
     newNode->next = NULL;
 
-    if (start == NULL) {
-        start = newNode;
+    if (markovChain->nextWords == NULL) {
+        markovChain->nextWords = newNode;
     } else {
-        Node* temp = start;
+        Node* temp = markovChain->nextWords;
         while (temp->next != NULL) {
             temp = temp->next;
         }
         temp->next = newNode;
     }
+
+    markovChain->count++;
 }
 
-void generatePhrase(int numWords) {
-    Node* current = start;
+char* chooseNextWord() {
+    int choice = rand() % markovChain->count;
+    Node* current = markovChain->nextWords;
 
-    if (current == NULL) {
+    while (choice > 0) {
+        current = current->next;
+        choice--;
+    }
+
+    return current->word;
+}
+
+void generateCompletion() {
+    if (markovChain->count == 0) {
         printf("There is not enough data to generate phrases.\n");
         return;
     }
 
-    // Next random initial word
-    int count = rand() % MAX_WORDS;
-    for (int i = 0; i < count; i++) {
+    printf("Type the beginning of a phrase: ");
+    char input[MAX_LEN];
+    fgets(input, sizeof(input), stdin);
+    input[strlen(input) - 1] = '\0'; // remove new line character
+
+    Node* current = markovChain->nextWords;
+    char* token = strtok(input, " ");
+
+    while (token != NULL) {
+        printf("%s ", token);
+
+        // Update current word for generating completion
+        strcpy(current->word, token);
+
         if (current->next == NULL) {
-            current = start;
+            current = markovChain->nextWords;
+        } else {
+            current = current->next;
+        }
+
+        token = strtok(NULL, " ");
+    }
+
+    printf("\nGenerated completion: %s ", input);
+
+    // Generate the completion
+    for (int i = 0; i < ORDER; i++) {
+        printf("%s ", current->word);
+
+        if (current->next == NULL) {
+            current = markovChain->nextWords;
         } else {
             current = current->next;
         }
     }
 
-    // generate phrase
-    for (int i = 0; i < numWords; i++) {
-        printf("%s ", current->word);
-        if (current->next == NULL) {
-            current = start;
-        } else {
-            current = current->next;
-        }
-    }
     printf("\n");
 }
 
-void training() {
+
+void trainingFromInput() {
     char input[MAX_LEN];
     char dataset[MAX_WORDS][MAX_LEN];
     int numWords = 0;
@@ -114,30 +149,76 @@ void training() {
     printf("Training completed successfully.\n");
 }
 
+void trainingFromFile() {
+    char filename[MAX_LEN];
+    printf("Enter the filename with training phrases: ");
+    scanf("%s", filename);
+
+    FILE* file = fopen(filename, "r");
+    if (file == NULL) {
+        printf("Failed to open the file.\n");
+        return;
+    }
+
+    char line[MAX_LEN];
+    while (fgets(line, sizeof(line), file)) {
+        line[strlen(line) - 1] = '\0'; // remove new line character
+        char* token = strtok(line, " ");
+        char* prevWords[ORDER];
+
+        for (int j = 0; j < ORDER; j++) {
+            prevWords[j] = (char*)malloc(MAX_LEN * sizeof(char));
+            strcpy(prevWords[j], "");
+        }
+
+        while (token != NULL) {
+            // insert current word in chain
+            char currentWord[MAX_LEN];
+            strcpy(currentWord, token);
+            insertWord(currentWord);
+
+            // update the older words
+            for (int j = 0; j < ORDER - 1; j++) {
+                strcpy(prevWords[j], prevWords[j + 1]);
+            }
+            strcpy(prevWords[ORDER - 1], currentWord);
+
+            token = strtok(NULL, " ");
+        }
+    }
+
+    fclose(file);
+    printf("Training completed successfully.\n");
+}
+
 int main() {
     srand(time(0));
 
     int choice;
+    markovChain = (MarkovChain*)malloc(sizeof(MarkovChain));
+    markovChain->count = 0;
+    markovChain->nextWords = NULL;
+
     do {
         printf("Menu:\n");
-        printf("1. Training\n");
-        printf("2. Generate Phrase\n");
-        printf("3. Exit\n");
+        printf("1. Training from input\n");
+        printf("2. Training from file\n");
+        printf("3. Type and Generate the Completion\n");
+        printf("4. Exit\n");
         printf("Enter your choice: ");
         scanf("%d", &choice);
 
         switch (choice) {
             case 1:
-                training();
+                trainingFromInput();
                 break;
-            case 2: {
-                int numWords;
-                printf("\nEnter the number of words to generate a phrase: ");
-                scanf("%d", &numWords);
-                generatePhrase(numWords);
+            case 2:
+                trainingFromFile();
                 break;
-            }
             case 3:
+                generateCompletion();
+                break;
+            case 4:
                 printf("Exiting program.\n");
                 break;
             default:
@@ -146,7 +227,17 @@ int main() {
         }
 
         printf("\n");
-    } while (choice != 3);
+    } while (choice != 4);
+
+    // Free memory
+    Node* current = markovChain->nextWords;
+    while (current != NULL) {
+        Node* temp = current;
+        current = current->next;
+        free(temp);
+    }
+
+    free(markovChain);
 
     return 0;
 }
