@@ -1,39 +1,96 @@
-# Simple LLM - Random Phrase Generator using Markov Chains
+# simple-llm-c
 
-This C script implements a random phrase generator using Markov Chains. It reads a set of training phrases provided by the user and constructs a data structure that represents the transition probabilities between the words present in the phrases. 
+Implementação de um LLM (Large Language Model) do zero em C puro, construído progressivamente em 6 fases didáticas.
 
-## Prerequisites
+## Estrutura do Projeto
 
-- C compiler (GCC or any other compatible compiler)
+```
+simple-llm-c/
+├── phase1/    — Álgebra linear, softmax, backpropagation
+├── phase2/    — Tokenizador BPE (Byte-Pair Encoding)
+├── phase3/    — Word2Vec (skip-gram, embeddings densos)
+├── phase4/    — FFLM (Feed-Forward Language Model)
+├── phase5/    — Transformer decoder-only (GPT-style)
+├── phase6/    — Quantização INT8/INT4
+├── pipeline/  — Chat interativo integrado
+└── generate_chat_corpus.py
+```
 
-## Usage Instructions
+## Fases
 
-1. Compile the source code using the C compiler of your choice.
-2. Run the generated program.
-3. Enter the training phrases when prompted by the program. Enter "exit" to stop entering phrases.
-4. Provide the number of words to generate a random phrase.
-5. The program will generate and display the random phrase.
+### Fase 1 — Fundamentos Matemáticos
+Operações de álgebra linear em C: multiplicação de matrizes, softmax, funções de ativação (ReLU, tanh, sigmoid), backpropagation manual, otimizador SGD.
 
-## Script Description
+### Fase 2 — Tokenizador BPE
+Byte-Pair Encoding do zero: contagem de pares, merge iterativo, vocabulário de subpalavras, encode/decode. Mesmo algoritmo usado em GPT-2/GPT-4.
 
-The `Node` structure that represents a node in the linked list. Each node contains a word and a pointer to the next node.
+### Fase 3 — Word2Vec
+Embeddings de palavras via skip-gram com negative sampling. Treinamento em corpus português, visualização por similaridade cosseno.
 
-The global variable `start` is declared to store the start of the linked list.
+### Fase 4 — Feed-Forward Language Model (FFLM)
+Primeira rede neural de linguagem: concatena embeddings de N tokens de contexto, passa por camadas densas, prevê próximo token via cross-entropy.
 
-The `insertWord` function is responsible for inserting a new word into the linked list.
+### Fase 5 — Transformer (decoder-only)
+Arquitetura GPT-style completa:
+- Multi-Head Causal Self-Attention (Q/K/V projetados, máscara triangular)
+- Feed-Forward com ReLU (FFN_HID=512)
+- LayerNorm + conexões residuais
+- Embeddings posicionais aprendidos
+- Backpropagation completo através da atenção
+- Otimizador Adam com bias correction
+- Geração com temperatura, top-p nucleus sampling e repetition penalty
 
-The `generatePhrase` function generates a random phrase based on the words present in the linked list.
+Configuração padrão: EMBED=256, HEADS=8, FFN=512, LAYERS=6, CTX=64.
 
-In the `main` function, the program starts by initializing the seed of the random number generator based on the current time.
+### Fase 6 — Quantização INT8/INT4
+Compressão de pesos para inferência eficiente:
+- **Q8_0**: simétrico por linha, escala = max(|linha|)/127, 1 byte/peso
+- **Q4_0**: blocos de 32, escala por bloco, nibbles com offset +8, 0.5 byte/peso
+- `q8_matvec`: multiplicação matriz-vetor quantizada com acumulador int32
+- Métricas: SNR, erro máximo, similaridade cosseno
 
-Next, variables for user input, the training set, and the desired number of words for the generated phrase are declared.
+### Pipeline — Chat Interativo
+Integra todas as fases: treina em corpus de chat em português, salva/carrega `model.bin`, chat com formato `user <msg> assistant <resposta>`, parada automática no token `user`.
 
-The program prompts the user to enter the training phrases. The phrases are read one by one and stored in the training set until the user enters "exit".
+## Compilação
 
-After the training phrases input, the program builds the Markov Chain. For each phrase in the training set, the program breaks the phrase into words using the whitespace delimiter. It then inserts each word into the linked list and updates the previous words used to construct the chain.
+Cada fase tem seu próprio Makefile:
 
-Finally, the program asks the user for the number of words to generate a random phrase and calls the `generatePhrase` function with the provided number..
+```bash
+cd phase5 && make
+cd phase6 && make
+cd pipeline && make
+```
 
-## Example
+## Pipeline (chat)
 
-gcc -o simple-llm-c.o ./simple-llm-c.c && ./simple-llm-c.o
+```bash
+# Gerar corpus de treinamento
+python generate_chat_corpus.py
+
+# Compilar e executar
+cd pipeline && make && ./pipeline.exe
+```
+
+Comandos disponíveis no chat:
+```
+t=0.8      — temperatura
+p=0.9      — top-p nucleus sampling
+r=1.3      — repetition penalty
+n=20       — tokens a gerar
+retreinar  — apaga model.bin e retreina
+sair       — encerrar
+```
+
+## Pré-requisitos
+
+- GCC (MinGW no Windows ou gcc no Linux/macOS)
+- Python 3 (somente para gerar o corpus)
+- Corpus de texto em português (`pt_BR.txt`) ou usar o gerador incluído
+
+## Referências
+
+- Vaswani et al. (2017) — *Attention Is All You Need*
+- Mikolov et al. (2013) — *Efficient Estimation of Word Representations in Vector Space*
+- Sennrich et al. (2016) — *Neural Machine Translation of Rare Words with Subword Units*
+- Frantar et al. (2022) — *GPTQ: Accurate Post-Training Quantization*
