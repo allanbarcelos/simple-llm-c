@@ -1,0 +1,927 @@
+================================================================================
+  CONSTRUINDO UM LLM DO ZERO EM C — DOCUMENTAÇÃO COMPLETA
+  Projeto: simple-llm-c
+  Autor: Allan Barcelos
+  Data: Abril 2026
+================================================================================
+
+Este documento descreve todas as fases do projeto, desde a cadeia de Markov
+até um Transformer com quantização INT8/INT4, implementado em C puro (sem
+dependências externas além da libm).
+
+
+================================================================================
+  FASE 0 — CADEIA DE MARKOV (ponto de partida)
+================================================================================
+
+OBJETIVO
+--------
+Chatbot simples baseado em transições estatísticas entre palavras. Não é uma
+rede neural — é o baseline que motivou a evolução para um LLM real.
+
+CONCEITO
+--------
+Uma cadeia de Markov de ordem N modela a probabilidade do próximo token dado
+os N tokens anteriores:
+
+  P(w_t | w_{t-1}, w_{t-2}, ..., w_{t-N})
+
+Para ordem 2:
+  Contexto = "quem ferro"
+  Candidatos = {"fere": 3 vezes, "usa": 1 vez, ...}
+  P("fere" | "quem ferro") = 3/4
+
+IMPLEMENTAÇÃO
+-------------
+Estrutura de dados: tabela hash com djb2
+
+  djb2(s):
+    h = 5381
+    para cada caractere c em s:
+      h = h * 33 + c
+    retorna h
+
+Bucket: h & (HASH_SIZE - 1)   onde HASH_SIZE = 2^18 = 262144
+
+Cada entrada armazena:
+  - context: string de N palavras concatenadas
+  - candidates: lista ligada de WordNode {word, count, next}
+  - count: total de ocorrências
+
+Geração:
+  1. Busca direta pelo contexto das últimas N palavras digitadas
+  2. Se não encontrar, busca por qualquer transição que contenha
+     uma palavra-chave da frase (excluindo stop words)
+  3. Fallback: transição aleatória
+
+LIMITAÇÕES IDENTIFICADAS
+------------------------
+- Sem generalização: palavras fora do corpus → sem resposta
+- Sem semântica: "amor" e "afeto" são palavras completamente diferentes
+- Contexto muito curto (máx 2 palavras)
+- Não aprende padrões de longa distância
+
+
+================================================================================
+  FASE 1 — FUNDAMENTOS MATEMÁTICOS
+================================================================================
+
+OBJETIVO
+--------
+Implementar do zero todas as primitivas matemáticas necessárias para redes
+neurais: álgebra linear, funções de ativação, funções de perda, e o algoritmo
+de backpropagation.
+
+ÁLGEBRA LINEAR (linalg.h / linalg.c)
+--------------------------------------
+Vetores e matrizes armazenados em arrays contíguos (row-major):
+
+  Matrix M[i][j] = M.data[i * M.cols + j]
+
+Operações implementadas:
+  - vec_dot(a, b):       Σ_i a[i] * b[i]
+  - vec_norm(a):         √(Σ_i a[i]²)
+  - mat_mul(A, B):       C[i][j] = Σ_k A[i][k] * B[k][j]   O(n³)
+  - mat_vec_mul(A, x):   y[i] = Σ_j A[i][j] * x[j]          O(n²)
+  - mat_T(A):            B[i][j] = A[j][i]
+  - mat_outer(a, b):     M[i][j] = a[i] * b[j]
+
+FUNÇÕES DE ATIVAÇÃO (nn_math.h / nn_math.c)
+--------------------------------------------
+
+Sigmoid:
+  σ(x) = 1 / (1 + e^{-x})
+  σ'(x) = σ(x) · (1 - σ(x))
+
+ReLU (Rectified Linear Unit):
+  ReLU(x) = max(0, x)
+  ReLU'(x) = 1 se x > 0, senão 0
+
+Softmax (numericamente estável):
+  Para evitar overflow, subtraímos o máximo antes de exponenciar:
+
+  softmax(z)_i = e^{z_i - max(z)} / Σ_j e^{z_j - max(z)}
+
+  Propriedades:
+  - Σ_i softmax(z)_i = 1  (distribuição de probabilidade)
+  - softmax(z)_i ∈ (0, 1)
+  - Invariante a translação: softmax(z) = softmax(z + c)
+
+FUNÇÕES DE PERDA
+-----------------
+
+Cross-Entropy (para classificação):
+  L = -log(p_{true})   onde p = softmax(z)
+
+  Clipada numericamente: L = -log(max(p, 1e-9))
+  Para evitar log(0) = -∞
+
+MSE (Mean Squared Error):
+  L = (1/n) Σ_i (y_i - ŷ_i)²
+
+BACKPROPAGATION — REGRA DA CADEIA
+-----------------------------------
+Para uma rede com camadas L₁, L₂, ..., Lₙ:
+
+  dL/dW₁ = dL/dL₂ · dL₂/dL₁ · dL₁/dW₁
+
+Gradiente de softmax + cross-entropy (simplificação analítica):
+  Se p = softmax(z) e L = -log(p_y):
+
+  dL/dz_i = p_i - 1{i = y}    (p_i menos 1 se for a classe correta)
+
+  Esta fórmula é a combinação de:
+  - dL/dp_y = -1/p_y
+  - dp_y/dz_i = p_y(1{i=y} - p_y)   (Jacobiano do softmax)
+
+Para camada linear y = Wx + b:
+  dL/dW = dL/dy · x^T   (produto externo)
+  dL/db = dL/dy
+  dL/dx = W^T · dL/dy
+
+Para ReLU:
+  dL/dx_i = dL/dy_i · 1{x_i > 0}
+
+DEMONSTRAÇÃO (demo.c)
+---------------------
+1 camada, treinamento de 40 passos com SGD:
+  - Loss inicial: ~1.386 (log(3) — três classes, igual probabilidade)
+  - Loss final:   ~0.01
+  - Convergência visível a partir do passo 10
+
+
+================================================================================
+  FASE 2 — TOKENIZADOR BPE (Byte Pair Encoding)
+================================================================================
+
+OBJETIVO
+--------
+Transformar texto em sequências de tokens inteiros. BPE é o tokenizador usado
+pelo GPT-2, GPT-3, GPT-4 e LLaMA.
+
+MOTIVAÇÃO
+---------
+Problemas com tokenização por palavra:
+  - "amor", "amores", "amoroso" = 3 tokens diferentes (sem compartilhamento)
+  - Palavras raras ou novas = UNK (desconhecido)
+  - Vocabulário explode com morfologia rica (português, alemão)
+
+BPE resolve isso com subpalavras:
+  "amoroso" → "amor" + "oso"
+  Compartilha "amor" com "amor", "amores", etc.
+
+ALGORITMO BPE — TREINAMENTO
+------------------------------
+Entrada: texto cru
+Saída: conjunto de regras de merge + vocabulário
+
+Passo 0 — Inicialização (byte-level):
+  Vocabulário inicial = 256 bytes (0x00 a 0xFF)
+  Cada caractere é um token de 1 byte
+
+Passos 1..N (iterativo):
+  1. Contar todos os pares de tokens adjacentes no corpus:
+     "amor" = [a, m, o, r]
+     Pares: (a,m)=1, (m,o)=1, (o,r)=1
+
+  2. Encontrar o par mais frequente (p*, q*):
+     (p*, q*) = argmax_{(p,q)} count(p,q)
+
+  3. Criar novo token: concat(p*, q*)
+     Ex: (a, m) → "am"    novo id = 256
+
+  4. Aplicar merge no corpus: substituir todas ocorrências de [p*, q*]
+     pelo novo token
+
+  5. Adicionar regra: merge_rules[n] = (p*, q*)
+
+  Repetir N vezes (N = BPE_MAX_MERGES = 512)
+
+ALGORITMO BPE — CODIFICAÇÃO (encode)
+---------------------------------------
+  1. Inicializar: cada byte do texto = 1 token
+  2. Para cada regra de merge (em ordem de criação):
+     Varrer sequência, substituir (p, q) pelo token merged
+
+  Complexidade: O(|texto| × |regras|)
+
+ALGORITMO BPE — DECODIFICAÇÃO (decode)
+-----------------------------------------
+  Para cada token id:
+    lookup na tabela vocab[id] → string original
+  Concatenar todas as strings
+
+IMPLEMENTAÇÃO (bpe.h / bpe.c)
+-------------------------------
+Constantes:
+  BPE_BYTE_VOCAB = 256     (vocabulário inicial)
+  BPE_MAX_MERGES = 512     (regras de merge)
+  BPE_MAX_VOCAB  = 768     (= 256 + 512)
+
+Tabela de pares: matriz 2D int pairs[768][768]
+  Contagem direta: O(V²) memória, O(|corpus|) por iteração
+
+Strings de tokens: vocab[id] = string (até 64 bytes)
+
+PROPRIEDADE IMPORTANTE
+-----------------------
+BPE é determinístico e reversível:
+  decode(encode(texto)) = texto   (sem perda de informação)
+
+
+================================================================================
+  FASE 3 — WORD2VEC: EMBEDDINGS DE PALAVRAS
+================================================================================
+
+OBJETIVO
+--------
+Aprender representações vetoriais densas de palavras, onde palavras com
+significado similar ficam próximas no espaço vetorial.
+
+O PROBLEMA
+----------
+Redes neurais precisam de vetores de números reais como entrada.
+One-hot encoding é ineficiente:
+  vocab_size = 50000 palavras
+  "amor" = [1, 0, 0, ..., 0]   → 50000 dimensões, majoritariamente zeros
+  Sem relação semântica: cos_sim("amor", "afeto") = 0
+
+Solução — embeddings densos:
+  "amor"  = [0.21, -0.45,  0.83, ...]   32 dimensões
+  "afeto" = [0.19, -0.41,  0.79, ...]   próximo de "amor"!
+  "ferro" = [-0.3,  0.72, -0.11, ...]   longe de "amor"
+
+SKIP-GRAM COM NEGATIVE SAMPLING (SGNS)
+----------------------------------------
+Hipótese distribucional (Harris, 1954):
+  "Palavras que ocorrem em contextos similares têm significados similares"
+
+Para cada palavra central c e palavra de contexto ctx na janela W:
+
+  Objetivo positivo: maximizar P(ctx | c)
+  Objetivo negativo: minimizar P(neg | c)  para K palavras negativas
+
+  Usando a função sigmoid:
+    score(c, ctx) = dot(W_in[c], W_out[ctx])
+    P(ctx | c) = σ(score(c, ctx)) = 1 / (1 + e^{-score})
+
+Loss por par (c, ctx):
+  L = -log(σ(score_pos)) - Σ_{k=1}^{K} log(1 - σ(score_neg_k))
+  L = -log(σ(score_pos)) - Σ_{k=1}^{K} log(σ(-score_neg_k))
+
+GRADIENTES
+----------
+Definindo p_pos = σ(score_pos):
+
+  fator positivo: (p_pos - 1)
+
+  dL/dW_in[c]   += (p_pos - 1) · W_out[ctx]
+  dL/dW_out[ctx] = (p_pos - 1) · W_in[c]
+
+Para cada negativo k, definindo p_neg = σ(score_neg_k):
+
+  fator negativo: p_neg
+
+  dL/dW_in[c]    += p_neg · W_out[neg_k]
+  dL/dW_out[neg_k] = p_neg · W_in[c]
+
+Estratégia de acumulação de gradientes:
+  - Acumular grad_c para W_in[c] ao longo de todos os contextos
+  - Atualizar W_in[c] uma vez por palavra central
+  - Atualizar W_out imediatamente por par
+
+AMOSTRAGEM DE NEGATIVOS
+------------------------
+Distribuição de ruído (Mikolov et al., 2013):
+
+  P_noise(w) ∝ freq(w)^{0.75}
+
+  O expoente 0.75 < 1 reduz a dominância de palavras muito frequentes
+  ("de", "a", "o") e aumenta a probabilidade de palavras raras.
+
+  Implementação: tabela de tamanho 2^18 = 262144 com IDs repetidos
+  proporcionalmente à distribuição de ruído.
+
+SIMILARIDADE DE COSSENO
+------------------------
+  sim(a, b) = dot(a, b) / (‖a‖ · ‖b‖)   ∈ [-1, 1]
+
+  1.0  = vetores idênticos
+  0.0  = vetores ortogonais (sem relação)
+  -1.0 = vetores opostos
+
+ARITMÉTICA VETORIAL (analogias)
+---------------------------------
+  v(rei) - v(homem) + v(mulher) ≈ v(rainha)
+
+  Implementação: q = v(a) - v(b) + v(c)
+  Resposta = argmax_{w ≠ a,b,c} sim(q, v(w))
+
+IMPLEMENTAÇÃO (word2vec.h / word2vec.c)
+-----------------------------------------
+  W2V_EMBED_DIM   = 32
+  W2V_WINDOW      = 2   (janela de contexto bilateral)
+  W2V_NEG_SAMPLES = 5   (negativos por par positivo)
+  W2V_HASH_SIZE   = 2^16 = 65536 buckets
+
+Duas matrizes de embeddings:
+  W_in  [vocab_size × 32]   embeddings de entrada (usados como representação final)
+  W_out [vocab_size × 32]   embeddings de saída (descartados após treino)
+
+Inicialização: W_in uniforme em [-0.5/dim, 0.5/dim], W_out = zeros
+
+
+================================================================================
+  FASE 4 — FEED-FORWARD LANGUAGE MODEL (FFLM)
+================================================================================
+
+OBJETIVO
+--------
+Implementar o primeiro modelo de linguagem neural real: a arquitetura de
+Bengio et al. (2003), "A Neural Probabilistic Language Model".
+
+ARQUITETURA
+-----------
+Dado um contexto de N tokens anteriores, prever o próximo token.
+
+  tokens[t-N .. t-1]
+       │ embedding lookup
+  x = [E[t-N] ‖ ... ‖ E[t-1]]    dim = N × D = 3 × 32 = 96
+       │ W1 · x + b1
+  z1   dim = H = 128              (camada oculta, pré-ativação)
+       │ ReLU
+  h    dim = H = 128              (pós-ativação)
+       │ W2 · h + b2
+  z2   dim = V                    (logits — um por token do vocabulário)
+       │ softmax
+  p    dim = V                    (distribuição de probabilidade)
+       │ cross-entropy
+  L  = -log(p[token_alvo])
+
+PARÂMETROS
+----------
+  E  : V × 32      embedding table         (lookup, não multiplicação)
+  W1 : 128 × 96    pesos da camada oculta
+  b1 : 128         bias da camada oculta
+  W2 : V × 128     pesos da camada de saída
+  b2 : V           bias da camada de saída
+
+  Total (V=5000): 5000×32 + 128×96 + 128 + 5000×128 + 5000
+               = 160000 + 12288 + 128 + 640000 + 5000
+               ≈ 817K parâmetros
+
+BACKPROPAGATION COMPLETO
+--------------------------
+
+1. Loss → logits:
+   δz2 = p - one_hot(target)      [dim V]
+   (gradiente combinado softmax + cross-entropy)
+
+2. Logits → camada oculta:
+   dL/dW2[v][j] = δz2[v] · h[j]   (produto externo)
+   dL/db2[v]    = δz2[v]
+   δh = W2^T · δz2                 [dim H]
+
+3. Camada oculta → pré-ativação (ReLU backward):
+   δz1[j] = δh[j] · 1{z1[j] > 0}  [dim H]
+
+4. Pré-ativação → embeddings e W1:
+   dL/dW1[j][i] = δz1[j] · x[i]   (produto externo)
+   dL/db1[j]    = δz1[j]
+   δx = W1^T · δz1                 [dim N×D]
+
+5. Embeddings (lookup com gradiente acumulado):
+   Para cada posição k no contexto (k = 0..N-1):
+     dL/dE[ctx[k]][d] += δx[k·D + d]
+
+OTIMIZADOR ADAM
+---------------
+Adam (Adaptive Moment Estimation) — Kingma & Ba, 2014:
+
+  Hiperparâmetros:
+    β1 = 0.9    (decaimento do 1º momento — média)
+    β2 = 0.999  (decaimento do 2º momento — variância)
+    ε  = 1e-8   (estabilidade numérica)
+
+  Para cada parâmetro θ e gradiente g no passo t:
+
+    m_t = β1 · m_{t-1} + (1-β1) · g         (1º momento: média exponencial)
+    v_t = β2 · v_{t-1} + (1-β2) · g²        (2º momento: variância exponencial)
+
+  Correção de bias (para t pequeno, m e v são subestimados):
+    m̂ = m_t / (1 - β1^t)
+    v̂ = v_t / (1 - β2^t)
+
+  Atualização:
+    θ ← θ - lr · m̂ / (√v̂ + ε)
+
+  Vantagem sobre SGD:
+    - Taxa de aprendizado adaptativa por parâmetro
+    - Gradientes grandes → passo menor (estabilidade)
+    - Gradientes pequenos → passo maior (convergência rápida)
+
+INICIALIZAÇÃO XAVIER (Glorot, 2010)
+-------------------------------------
+  scale = √(2 / fan_in)
+  w ~ Uniforme(-scale, +scale)
+
+  Mantém variância dos gradientes constante ao longo das camadas,
+  evitando explosão ou desaparecimento de gradientes.
+
+GERAÇÃO DE TEXTO (Temperature Sampling)
+-----------------------------------------
+  p'_i = p_i^{1/T}  (re-normalizado)
+
+  T → 0 : sempre escolhe o token mais provável (greedy)
+  T = 1  : distribuição original do modelo
+  T → ∞  : distribuição uniforme (totalmente aleatório)
+
+  Implementação estável:
+    Dividir logits por T antes do softmax:
+    logit'_i = logit_i / T  →  softmax(logit') = p_i^{1/T} (normalizado)
+
+PERPLEXIDADE
+------------
+  PPL = e^{L_médio}   onde L_médio = média do cross-entropy loss
+
+  Interpretação: quantas palavras plausíveis o modelo considera
+  em média ao prever o próximo token.
+
+  PPL = 1000 → praticamente aleatório (vocabulário de 1000 palavras)
+  PPL = 10   → modelo útil para corpus pequeno
+
+
+================================================================================
+  FASE 5 — TRANSFORMER (GPT-STYLE, DECODER-ONLY)
+================================================================================
+
+OBJETIVO
+--------
+Implementar a arquitetura Transformer completa (Vaswani et al., 2017; GPT),
+com self-attention multi-cabeça, layer normalization, e treinamento por
+backpropagation.
+
+POR QUE O TRANSFORMER SUPERA O FFLM
+--------------------------------------
+FFLM (Fase 4):
+  Contexto = concatenação de N embeddings → comprimento fixo
+  "quem ferro fere" → token "fere" não "vê" "quem" diretamente
+  O gradiente de "quem" passa por toda a matriz W1
+
+Transformer:
+  Cada token presta atenção em QUALQUER outro token anterior
+  "fere" pode olhar diretamente para "quem" e "ferro"
+  Dependências de longa distância sem degradação de gradiente
+
+MECANISMO QUERY-KEY-VALUE
+--------------------------
+Para um token na posição t:
+
+  Q[t] = "o que estou procurando?"     (query)
+  K[s] = "o que ofereço para matches?" (key,   todos os tokens s)
+  V[s] = "qual informação eu passo?"   (value, todos os tokens s)
+
+  score(t, s) = dot(Q[t], K[s]) / √d_head
+
+  Divisão por √d_head: evita que o produto interno cresça com a dimensão,
+  o que empurraria o softmax para regiões de gradiente muito pequeno.
+
+ATENÇÃO ESCALADA (Scaled Dot-Product Attention)
+-------------------------------------------------
+  scores[t][s] = Q[t] · K[s] / √d_head      para s = 0..t (causal)
+
+  Máscara causal: scores[t][s] = -∞  para s > t
+  (token t não pode ver tokens futuros)
+
+  attn[t][s] = softmax(scores[t][:])[s]
+
+  Propriedade: Σ_s attn[t][s] = 1
+               attn[t][s] = 0 para s > t   (após softmax de -∞)
+
+  out[t] = Σ_s attn[t][s] · V[s]           (média ponderada dos values)
+
+MULTI-HEAD ATTENTION
+---------------------
+Em vez de uma atenção com d_model dimensões, usamos H cabeças paralelas
+de d_head = d_model / H dimensões cada:
+
+  Para cada cabeça h = 0..H-1:
+    Q_h = x · WQ_h    [seq × d_head]    (sub-espaço da cabeça h)
+    K_h = x · WK_h
+    V_h = x · WV_h
+    out_h = Attention(Q_h, K_h, V_h)   [seq × d_head]
+
+  Concatenar: [out_0 ‖ out_1 ‖ ... ‖ out_{H-1}]    [seq × d_model]
+  Projetar:   x_attn = concat · WO                  [seq × d_model]
+
+  Cada cabeça aprende um tipo diferente de relação:
+  - Relações sintáticas (sujeito → verbo)
+  - Relações semânticas (palavra → sinônimo)
+  - Relações posicionais
+
+LAYER NORMALIZATION
+--------------------
+Aplica normalização ao longo da dimensão de embedding para cada token:
+
+  μ  = (1/d) Σ_i x_i                (média)
+  σ² = (1/d) Σ_i (x_i - μ)²        (variância)
+  x̂_i = (x_i - μ) / √(σ² + ε)     (normalização)
+  y_i = g_i · x̂_i + b_i            (re-escala aprendida)
+
+  onde g (gain) e b (bias) são parâmetros treináveis, inicializados em g=1, b=0.
+
+  Efeito: estabiliza os gradientes em redes profundas, permite taxas de
+  aprendizado maiores.
+
+BACKWARD ATRAVÉS DA LAYER NORM
+---------------------------------
+  dL/dx_i = g_i / √(σ²+ε) · [dL/dy_i - (1/d)·Σ_j dL/dy_j·g_j
+                              - x̂_i · (1/d) Σ_j dL/dy_j·g_j·x̂_j]
+  dL/dg_i = Σ_t dL/dy_i^t · x̂_i^t   (somado sobre posições)
+  dL/db_i = Σ_t dL/dy_i^t
+
+CONEXÕES RESIDUAIS
+-------------------
+  x_out = x_in + sublayer(x_in)
+
+  Motivação: gradiente flui diretamente pela conexão identidade.
+  dL/dx_in = dL/dx_out · (I + d(sublayer)/dx_in)
+
+  O termo I garante que dL/dx_in ≥ dL/dx_out (sem desaparecimento).
+  Permite treinar redes com dezenas de camadas.
+
+ARQUITETURA COMPLETA DE UM BLOCO
+----------------------------------
+  Entrada: x [SEQ × EMBED]
+
+  1. x_norm1 = LayerNorm(x)
+  2. Q = x_norm1 · WQ + bQ,   K = x_norm1 · WK + bK,   V = x_norm1 · WV + bV
+  3. scores[h][t][s] = (Q_h[t] · K_h[s]) / √d_head  (por cabeça h)
+  4. scores[h][t][s] = -∞  para s > t  (máscara causal)
+  5. attn[h][t] = softmax(scores[h][t])
+  6. av[t] = concat_h(Σ_s attn[h][t][s] · V_h[s])
+  7. x_attn = av · WO + bO
+  8. x = x + x_attn                 (residual 1)
+  9. x_norm2 = LayerNorm(x)
+  10. ffn_h = ReLU(x_norm2 · W1 + b1)
+  11. ffn_out = ffn_h · W2 + b2
+  12. x = x + ffn_out               (residual 2)
+
+BACKWARD ATRAVÉS DA SOFTMAX DE ATENÇÃO
+-----------------------------------------
+Dada attn = softmax(scores) e d_attn (gradiente de attn):
+
+  Para cada linha t:
+    dot = Σ_s d_attn[t][s] · attn[t][s]
+    d_scores[t][s] = attn[t][s] · (d_attn[t][s] - dot)   para s ≤ t
+    d_scores[t][s] = 0                                     para s > t
+
+BACKWARD DA ATENÇÃO MULTI-CABEÇA
+-----------------------------------
+Para cada cabeça h:
+
+  d_V[s][off..] += Σ_t attn[h][t][s] · d_av[t][off..]
+  d_attn[h][t][s] = Σ_d d_av[t][off+d] · V[s][off+d]
+
+  Após softmax backward → d_scores[h][t][s]
+
+  d_Q[t][off..] += Σ_s d_scores[h][t][s] · K[s][off..] / √d_head
+  d_K[s][off..] += Σ_t d_scores[h][t][s] · Q[t][off..] / √d_head
+
+EMBEDDING POSICIONAL
+---------------------
+O Transformer não tem recorrência — sem codificação posicional, todos os
+tokens seriam equivalentes (permutação invariante).
+
+Implementação neste projeto: embeddings posicionais aprendidos
+  pos_emb [TF_CONTEXT × TF_EMBED]   inicializados com Xavier
+
+Alternativa (artigo original): codificação sinusoidal
+  PE[pos][2i]   = sin(pos / 10000^{2i/d_model})
+  PE[pos][2i+1] = cos(pos / 10000^{2i/d_model})
+
+Entrada do primeiro bloco:
+  x[t] = emb[token[t]] + pos_emb[t]
+
+CONFIGURAÇÃO DESTE MODELO
+--------------------------
+  TF_EMBED    = 64    (dimensão de embedding)
+  TF_HEADS    = 4     (cabeças de atenção)
+  TF_HEAD_DIM = 16    (= EMBED / HEADS)
+  TF_FFN_HID  = 128   (neurônios do FFN)
+  TF_LAYERS   = 2     (blocos empilhados)
+  TF_CONTEXT  = 16    (janela de contexto)
+  TF_MAX_VOCAB = 20000
+
+BUG CRÍTICO CORRIGIDO (stack overflow)
+-----------------------------------------
+Na primeira implementação, tf_backward declarava:
+  float d_lmh[TF_MAX_VOCAB * TF_EMBED]  →  20000×64×4 = 5 MB na pilha!
+  float d_emb [TF_MAX_VOCAB * TF_EMBED]  →  outros 5 MB
+
+Stack padrão no Windows = 1-2 MB → crash silencioso após o treino.
+Solução: calloc() (heap) + free() ao final.
+
+Também em block_backward:
+  dWQ, dWK, dWV, dWO, dW1, dW2  → movidos para o heap (128 KB por chamada)
+
+
+================================================================================
+  FASE 6 — QUANTIZAÇÃO DE PESOS (INT8 / INT4)
+================================================================================
+
+OBJETIVO
+--------
+Reduzir o uso de memória e aumentar a velocidade de inferência substituindo
+pesos float32 por representações de menor precisão.
+
+MOTIVAÇÃO
+---------
+  Modelo GPT-2 (117M parâmetros):
+    float32: 117M × 4 bytes = 468 MB
+    INT8:    117M × 1 byte  = 117 MB  (4× menos)
+    INT4:    117M × 0.5b    =  59 MB  (8× menos)
+
+  LLaMA 3.2 1B:
+    float32: 4.0 GB  → não cabe em muitas máquinas
+    INT8:    1.0 GB
+    INT4:    0.5 GB  → roda em 8 GB RAM
+
+TOLERÂNCIA DE REDES NEURAIS À QUANTIZAÇÃO
+-------------------------------------------
+Pesos de redes neurais treinadas são robustos a ruído de quantização porque:
+1. O treino por gradiente descendente convergiu para uma região plana do
+   espaço de perda (plateau) → pequenas perturbações não saem do plateau
+2. Os pesos têm distribuição aproximadamente gaussiana → não há outliers
+   extremos que causariam perda de precisão
+
+QUANTIZAÇÃO INT8 SIMÉTRICA POR LINHA (Q8_0)
+----------------------------------------------
+Para cada linha i de uma matriz W:
+
+  scale_i = max(|W[i][j]|) / 127
+
+  W_q[i][j] = round(W[i][j] / scale_i)   ∈ [-128, 127]
+
+  Dequantização: W̃[i][j] = W_q[i][j] × scale_i
+
+  Erro máximo por elemento: 0.5 × scale_i
+
+  SNR (Signal-to-Noise Ratio):
+    SNR = 10 · log10(Σ W² / Σ (W - W̃)²)   em dB
+
+    INT8 típico: SNR ≈ 48 dB (excelente)
+
+MATVEC COM ACUMULADOR INTEIRO (inferência eficiente)
+-------------------------------------------------------
+Em vez de dequantizar W e fazer float mul:
+
+  1. Quantizar ativação x de entrada (escala global):
+     scale_x = max(|x[j]|) / 127
+     x_q[j]  = round(x[j] / scale_x)   ∈ [-128, 127]
+
+  2. Produto interno inteiro:
+     sum_q = Σ_j W_q[i][j] × x_q[j]    (int32 accumulator)
+
+  3. Dequantizar saída:
+     y[i] = sum_q × scale_W[i] × scale_x
+
+  Vantagem: operações int8×int8→int32 são 2-4× mais rápidas que float32
+  em CPUs modernas (SIMD: AVX2 tem instrução _mm256_maddubs_epi16).
+
+QUANTIZAÇÃO INT4 POR BLOCO (Q4_0 — formato GGUF/llama.cpp)
+--------------------------------------------------------------
+Grupo de 32 pesos consecutivos = 1 bloco.
+
+Para cada bloco b:
+  scale_b = max(|W[k]|, k ∈ bloco) / 7
+
+  W_q[k] = round(W[k] / scale_b)   ∈ [-8, 7]  (INT4 signed)
+
+  Armazenamento: offset +8 → W_u[k] = W_q[k] + 8  ∈ [0, 15]  (nibble)
+
+  Dois nibbles por byte: byte[idx/2] = nibble_baixo | (nibble_alto << 4)
+
+  Dequantização: W̃[k] = (nibble[k] - 8) × scale_b
+
+  Memória:
+    pesos:  (rows × cols) / 2 bytes
+    scales: (rows × cols / 32) × 4 bytes (um float32 por bloco)
+
+POR QUE BLOCOS E NÃO ESCALA GLOBAL?
+--------------------------------------
+Com escala global (um scale para toda a matriz):
+  range = max(|W|) / 7
+  Elementos pequenos (|W| << max): poucos valores distintos → alta distorção
+
+Com escala por bloco de 32:
+  Cada sub-região tem seu próprio scale
+  SNR típico INT4 por bloco: 28-35 dB   (aceitável)
+  SNR INT4 escala global:    15-20 dB   (ruim)
+
+TAMANHOS DE BLOCO COMUNS
+--------------------------
+  Q4_0 (llama.cpp): 32 pesos por bloco
+  Q4_K:             bloco maior + scales quantizados
+  GPTQ:             128 pesos por bloco + calibração
+
+MÉTRICAS DE QUALIDADE
+----------------------
+SNR (dB):
+  SNR = 10 · log10(Σ w² / Σ (w-w̃)²)
+  > 40 dB: excelente  |  > 30 dB: bom  |  < 20 dB: ruim
+
+Similaridade de cosseno do output:
+  Dado x aleatório:
+    y_f32 = W · x        (float32)
+    y_q   = W̃ · x       (dequantizado)
+    cos_sim(y_f32, y_q)  → tipicamente > 0.9999 para INT8, > 0.999 para INT4
+
+CONEXÃO COM LLAMA.CPP / GGUF
+-------------------------------
+O formato GGUF (usado por Ollama, llama.cpp, LM Studio):
+  Q4_0: idêntico ao nosso — nibbles + scale float16 por bloco de 32
+  Q4_K: escala e zero_point também quantizados (melhor precisão)
+  Q8_0: INT8 simétrico + scale float16 por bloco de 32
+  Q2_K: 2 bits/peso — modelos 7B em 2 GB RAM
+
+A diferença principal é que llama.cpp usa SIMD (AVX2, NEON) para
+executar 32 multiplicações int8 em paralelo por instrução.
+
+
+================================================================================
+  PIPELINE INTEGRADO
+================================================================================
+
+FLUXO COMPLETO DE DADOS
+-----------------------
+  texto.txt
+     │
+     ▼
+  [Vocabulário] tfv_build()
+     tokenize() → int[] tokens
+     │
+     ▼
+  [Transformer] tf_new() → tf_train() → model.bin
+     │
+     ▼
+  [Quantização] q8_quantize() / q4_quantize()
+     mostrar métricas: SNR, cos_sim, memória
+     │
+     ▼
+  [Loop interativo] tf_generate()
+     temperatura, tamanho configuráveis
+
+SALVAMENTO DO MODELO (model.bin)
+----------------------------------
+Formato binário simples (sem cabeçalho de versão):
+  [int: vocab_size]
+  [float × vocab_size × TF_EMBED: emb]
+  [float × TF_CONTEXT × TF_EMBED: pos_emb]
+  [float × vocab_size × TF_EMBED: lm_head]
+  [float × TF_EMBED: ln_f_g, ln_f_b]
+  Para cada bloco l = 0..TF_LAYERS-1:
+    [float × TF_EMBED²: WQ, WK, WV, WO]
+    [float × TF_EMBED:  bQ, bK, bV, bO]
+    [float × TF_FFN_HID × TF_EMBED: W1]
+    [float × TF_FFN_HID:            b1]
+    [float × TF_EMBED × TF_FFN_HID: W2]
+    [float × TF_EMBED:              b2, ln1_g, ln1_b, ln2_g, ln2_b]
+
+Na segunda execução: carrega model.bin e pula o treino.
+
+COMANDOS DO CHAT
+-----------------
+  <texto>     → gera continuação com configurações atuais
+  t=0.7       → temperatura conservadora (mais coerente)
+  t=1.0       → distribuição original do modelo
+  t=1.5       → mais criativo / aleatório
+  n=20        → gerar 20 tokens
+  retreinar   → remove model.bin (próximo run retreina do zero)
+  sair        → encerrar
+
+
+================================================================================
+  COMPARAÇÃO ENTRE AS ABORDAGENS
+================================================================================
+
+  Abordagem          Contexto  Parâmetros  Generaliza  Semântica
+  -----------------  --------  ----------  ----------  ---------
+  Markov (Fase 0)    2 tokens  O(corpus)   Não         Não
+  FFLM   (Fase 4)    3 tokens  ~800K       Sim         Parcial
+  Transformer (F5)   16 tokens ~2M         Sim         Sim
+
+  Fase    Conceito-chave            Inovação
+  ------  ------------------------  ------------------------------------------
+  F1      Backpropagation           Regra da cadeia para treinar qualquer rede
+  F2      BPE tokenizer             Subpalavras, vocabulário aberto
+  F3      Word2Vec SGNS             Embeddings densos, semântica geométrica
+  F4      FFLM + Adam               Primeira rede de linguagem neural
+  F5      Self-attention            Dependências de longa distância, O(n²)
+  F6      Quantização INT8/INT4     4-8× menos memória, inferência na CPU
+
+
+================================================================================
+  COMO EXECUTAR CADA FASE
+================================================================================
+
+Pré-requisito: MSYS2 com GCC e make instalados
+  pacman -S mingw-w64-ucrt-x86_64-gcc make
+
+Fase 1 (matemática):
+  cd /c/Projects/simple-llm-c/phase1 && make && ./phase1_demo.exe
+
+Fase 2 (BPE tokenizador):
+  cd /c/Projects/simple-llm-c/phase2 && make && ./phase2_demo.exe
+
+Fase 3 (Word2Vec):
+  cd /c/Projects/simple-llm-c/phase3 && make && ./phase3_demo.exe
+
+Fase 4 (FFLM):
+  cd /c/Projects/simple-llm-c/phase4 && make && ./phase4_demo.exe
+
+Fase 5 (Transformer):
+  cd /c/Projects/simple-llm-c/phase5 && make && ./phase5_demo.exe
+
+Fase 6 (Quantização):
+  cd /c/Projects/simple-llm-c/phase6 && make && ./phase6_demo.exe
+
+Pipeline completo (chat interativo):
+  cd /c/Projects/simple-llm-c/pipeline && make && ./pipeline.exe
+
+Com corpus maior (melhor qualidade):
+  ./pipeline.exe ../corpus_pt_BR.txt 15 0.001
+
+
+================================================================================
+  ESTRUTURA DE ARQUIVOS
+================================================================================
+
+simple-llm-c/
+  simple-llm-c.c          Chatbot Markov (Fase 0)
+  generate_corpus.py       Gerador de corpus português (100 MB)
+  corpus_pt_BR.txt         Corpus gerado (101 MB, 17M palavras)
+  pt_BR.txt                Corpus pequeno (provérbios)
+  DOCUMENTACAO.txt         Este arquivo
+
+  phase1/
+    linalg.h / linalg.c    Álgebra linear
+    nn_math.h / nn_math.c  Funções de ativação, perda, gradientes
+    demo.c / Makefile
+
+  phase2/
+    bpe.h / bpe.c          Tokenizador BPE byte-level
+    demo.c / Makefile
+
+  phase3/
+    word2vec.h / word2vec.c  Skip-gram com Negative Sampling
+    demo.c / Makefile
+
+  phase4/
+    fflm.h / fflm.c        Feed-Forward Language Model + Adam
+    demo.c / Makefile
+
+  phase5/
+    transformer.h           Header com structs e API
+    transformer.c           Transformer completo (forward + backward)
+    demo.c / Makefile
+
+  phase6/
+    quant.h / quant.c      Quantização INT8/INT4 + benchmark
+    demo.c / Makefile
+
+  pipeline/
+    main.c                 Pipeline integrado com chat interativo
+    Makefile               Compila fases 5+6 juntas
+
+
+================================================================================
+  REFERÊNCIAS
+================================================================================
+
+Bengio, Y. et al. (2003). A Neural Probabilistic Language Model.
+  → Base da Fase 4 (FFLM)
+
+Mikolov, T. et al. (2013). Distributed Representations of Words and Phrases.
+  → Base da Fase 3 (Word2Vec SGNS)
+
+Vaswani, A. et al. (2017). Attention Is All You Need.
+  → Base da Fase 5 (Transformer)
+
+Kingma, D. & Ba, J. (2014). Adam: A Method for Stochastic Optimization.
+  → Otimizador das Fases 4 e 5
+
+Glorot, X. & Bengio, Y. (2010). Understanding the difficulty of training
+  deep feedforward neural networks.
+  → Inicialização Xavier (Fase 4 e 5)
+
+Dettmers, T. et al. (2022). LLM.int8(): 8-bit Matrix Multiplication for
+  Transformers at Scale.
+  → Motivação da Fase 6
+
+llama.cpp / ggerganov (2023). GGUF format, Q4_0 quantization.
+  → Implementação de referência para Fase 6
+
+================================================================================
+  FIM DO DOCUMENTO
+================================================================================
